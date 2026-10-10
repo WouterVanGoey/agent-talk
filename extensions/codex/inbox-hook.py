@@ -18,8 +18,9 @@ Codex calls it once per hook event, with the event as the first argument:
                                       to handle the message, with no typing.
 
 Which spool(s) to read is set per session by the agent-talk init skill when the
-delivery mode is "auto". It sets AGENT_TALK_CODEX_SPOOLS to a colon-separated
-list of absolute inbox.ndjson paths before launching Codex. With that variable
+delivery mode is "auto". It sets AGENT_TALK_CODEX_SPOOLS to absolute inbox.ndjson
+paths separated by os.pathsep (colon on POSIX, semicolon on Windows) before
+launching Codex. With that variable
 unset the script exits silently, so installing the hooks does not change any
 session that has not opted in.
 
@@ -53,7 +54,7 @@ FINGERPRINT_BYTES = 256
 
 def spools():
     raw = os.environ.get("AGENT_TALK_CODEX_SPOOLS", "")
-    return [p for p in (part.strip() for part in raw.split(":")) if p]
+    return [p for p in (part.strip() for part in raw.split(os.pathsep)) if p]
 
 
 def state_path(spool):
@@ -85,12 +86,11 @@ def write_state(spool, offset, ids, sha, sha_len):
                                     "ids": ids[-MAX_REMEMBERED_IDS:],
                                     "sha": sha, "sha_len": sha_len}
     tmp = state_path(spool) + ".tmp"
-    try:
-        with open(tmp, "w") as fh:
-            json.dump(data, fh)
-        os.replace(tmp, state_path(spool))
-    except OSError:
-        pass  # a hook must never break the session over its own bookkeeping
+    # Let drain defer delivery when persistence fails. Returning messages
+    # without committing their cursor would report them again on every hook.
+    with open(tmp, "w") as fh:
+        json.dump(data, fh)
+    os.replace(tmp, state_path(spool))
 
 
 def drain(spool):
@@ -104,9 +104,9 @@ def drain(spool):
                      os.O_WRONLY | os.O_CREAT, 0o600)
         with os.fdopen(fd, "wb") as lock:
             if os.name == "nt":
-                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
             else:
-                fcntl.flock(lock, fcntl.LOCK_EX)
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return drain_locked(spool)
     except OSError:
         return []  # leave messages pending if bookkeeping is unavailable

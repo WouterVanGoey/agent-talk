@@ -15,19 +15,29 @@ Asserts:
 """
 
 import concurrent.futures
+import importlib.util
 import json
-import select
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 if os.name != "nt":
     import fcntl
+else:
+    import msvcrt
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HOOK = os.path.join(ROOT, "extensions", "codex", "inbox-hook.py")
+
+
+def load_hook():
+    spec = importlib.util.spec_from_file_location("inbox_hook", HOOK)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def record_line(mid, text):
@@ -47,7 +57,7 @@ class TestInboxHookCursor(unittest.TestCase):
         """Run the stop hook once; return the delivered texts (may be [])."""
         res = subprocess.run(
             [sys.executable, HOOK, "stop"], input="{}",
-            capture_output=True, text=True,
+            capture_output=True, text=True, timeout=2,
             env=dict(os.environ, AGENT_TALK_CODEX_SPOOLS=self.spool))
         self.assertEqual(res.returncode, 0, res.stderr)
         if not res.stdout.strip():
@@ -60,29 +70,28 @@ class TestInboxHookCursor(unittest.TestCase):
         with open(self.spool, "w") as fh:
             fh.write(content)
 
-    @unittest.skipIf(os.name == "nt", "POSIX lock and pipe readiness probe")
-    def test_shared_cursor_lock_is_respected(self):
+    def test_shared_cursor_contention_defers_without_blocking(self):
         self.write_spool(record_line("m1", "waiting for the cursor lock"))
         lock_path = os.path.join(os.path.dirname(self.spool),
                                  ".codex-hook-state.json.lock")
-        with open(lock_path, "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            proc = subprocess.Popen(
-                [sys.executable, HOOK, "stop"], stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                env=dict(os.environ, AGENT_TALK_CODEX_SPOOLS=self.spool))
+        with open(lock_path, "ab") as lock:
+            if os.name == "nt":
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(lock, fcntl.LOCK_EX)
             try:
-                proc.stdin.write("{}")
-                proc.stdin.close()
-                proc.stdin = None
-                readable, _, _ = select.select([proc.stdout], [], [], 0.5)
-                self.assertEqual(readable, [],
-                                 "hook delivered before acquiring cursor lock")
+                # A hook must finish while the other process still holds the
+                # lock, without committing a cursor or reporting delivery.
+                self.assertEqual(self.run_hook(), [])
+                self.assertFalse(os.path.exists(os.path.join(
+                    os.path.dirname(self.spool), ".codex-hook-state.json")))
             finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
-                stdout, stderr = proc.communicate(timeout=10)
-            self.assertEqual(proc.returncode, 0, stderr)
-            self.assertIn("waiting for the cursor lock", stdout)
+                if os.name == "nt":
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+        self.assertIn("waiting for the cursor lock", "".join(self.run_hook()))
         self.assertEqual(self.run_hook(), [])
 
     def test_parallel_hooks_deliver_each_spool_once(self):
@@ -106,10 +115,60 @@ class TestInboxHookCursor(unittest.TestCase):
         for result in results:
             self.assertEqual(result.returncode, 0, result.stderr)
         output = "".join(result.stdout for result in results)
+        # Contended hooks defer to a later lifecycle event. Drain every spool
+        # once more after concurrent hooks finish to collect deferred records.
+        output += "".join(run(spool).stdout for spool in spools)
         for i, spool in enumerate(spools):
             self.assertEqual(output.count(f"question {i}"), 1)
             self.assertEqual(run(spool).stdout, "",
                              "another session overwrote this spool's cursor")
+
+    def test_windows_spool_paths_keep_drive_letters(self):
+        hook = load_hook()
+        paths = [r"C:\Users\example\sessions\one.ndjson",
+                 r"D:\Work\sessions\two.ndjson"]
+        with patch.object(hook.os, "pathsep", ";"), patch.dict(
+                os.environ, AGENT_TALK_CODEX_SPOOLS=" ; ".join(paths)):
+            self.assertEqual(hook.spools(), paths)
+
+    def test_posix_spool_paths_keep_colon_separator(self):
+        hook = load_hook()
+        with patch.object(hook.os, "pathsep", ":"), patch.dict(
+                os.environ, AGENT_TALK_CODEX_SPOOLS=" /one.ndjson : /two.ndjson : "):
+            self.assertEqual(hook.spools(), ["/one.ndjson", "/two.ndjson"])
+
+    def assert_persistence_failure_defers(self, failure):
+        hook = load_hook()
+        self.write_spool(record_line("m1", "already delivered"))
+        self.assertEqual(len(hook.drain(self.spool)), 1)
+        with open(hook.state_path(self.spool), "rb") as fh:
+            prior_state = fh.read()
+        with open(self.spool, "a") as fh:
+            fh.write(record_line("m2", "pending until persisted"))
+        real_open = open
+
+        def fail_temp_open(path, mode="r", *args, **kwargs):
+            if str(path).endswith(".tmp") and mode == "w":
+                raise OSError("synthetic cursor write failure")
+            return real_open(path, mode, *args, **kwargs)
+
+        failing_operation = (patch.object(hook.os, "replace", side_effect=OSError(
+            "synthetic cursor replace failure")) if failure == "replace" else
+            patch("builtins.open", side_effect=fail_temp_open))
+        with failing_operation:
+            self.assertEqual(hook.drain(self.spool), [])
+            self.assertEqual(hook.drain(self.spool), [])
+            with open(hook.state_path(self.spool), "rb") as fh:
+                self.assertEqual(fh.read(), prior_state)
+        self.assertEqual(hook.drain(self.spool),
+                         [{"name": "alice", "text": "pending until persisted"}])
+        self.assertEqual(hook.drain(self.spool), [])
+
+    def test_cursor_replace_failure_defers_delivery(self):
+        self.assert_persistence_failure_defers("replace")
+
+    def test_cursor_write_failure_defers_delivery(self):
+        self.assert_persistence_failure_defers("write")
 
     def test_append_delivers_once(self):
         self.write_spool(record_line("m1", "first question"))
