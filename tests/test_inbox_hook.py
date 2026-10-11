@@ -184,6 +184,7 @@ class TestInboxHookCursor(unittest.TestCase):
     def test_truncate_and_regrow_to_same_size(self):
         first = record_line("aaaa1111", "question one")
         self.write_spool(first)
+        original_size = os.path.getsize(self.spool)  # includes native CRLF translation
         self.run_hook()
 
         # Refill to exactly the old byte length with a different message, as a
@@ -191,7 +192,7 @@ class TestInboxHookCursor(unittest.TestCase):
         pad = len(first) - len(record_line("bbbb2222", "question two"))
         second = record_line("bbbb2222", "question two" + " " * pad)
         self.write_spool(second)
-        self.assertEqual(os.path.getsize(self.spool), len(first),
+        self.assertEqual(os.path.getsize(self.spool), original_size,
                          "the test must regrow the spool to the same size")
 
         delivered = "".join(self.run_hook())
